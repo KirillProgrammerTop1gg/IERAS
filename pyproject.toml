@@ -1,0 +1,27 @@
+[project]
+name = "ieras"
+version = "0.1.0"
+description = "Independent Exoplanet Research and Analysis System (IERAS)"
+requires-python = ">=3.11"
+# Dependencies are listed in requirements.txt; this file configures project tools.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+# Network tests are excluded by default because archives may be unavailable or change.
+addopts = "-m 'not network' -ra"
+markers = [
+    "network: live requests to NASA Exoplanet Archive, MAST, Gaia, ESO, or SIMBAD (run: pytest -m network)",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".venv", "data", "logs", "reports"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Notebooks intentionally import modules after configuring sys.path.
+"notebooks/*.ipynb" = ["E402", "I001", "F401"]

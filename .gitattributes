@@ -1,0 +1,4 @@
+# Keep text files with LF endings so diffs stay consistent across Windows and Linux
+* text=auto eol=lf
+*.fits binary
+*.db binary

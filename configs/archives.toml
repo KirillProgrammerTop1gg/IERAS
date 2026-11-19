@@ -1,0 +1,39 @@
+# External archive and cross-matching settings.
+# Adjust values without editing code. Verify URLs against archive documentation.
+
+[nasa_exoplanet_archive]
+# NASA Exoplanet Archive TAP service (ADQL). Documentation: https://exoplanetarchive.ipac.caltech.edu/docs/TAP/usingTAP.html
+tap_url = "https://exoplanetarchive.ipac.caltech.edu/TAP"
+# Summary table: one row per planet with default parameters.
+table = "pscomppars"
+
+[mast]
+# Default missions for light-curve searches: TESS, Kepler, K2, etc.
+default_mission = "TESS"
+# Product subgroups treated as light curves:
+#   LC      — TESS 2-minute/30-minute light curve (SPOC)
+#   LLC     — Kepler long cadence
+#   SLC     — Kepler short cadence
+#   FAST-LC — TESS 20-second light curve
+lightcurve_subgroups = ["LC", "LLC", "SLC", "FAST-LC"]
+
+[gaia]
+# Gaia DR3 table. Before stage 4, verify the release and schema at https://gea.esac.esa.int/archive/
+table = "gaiadr3.gaia_source"
+
+[eso]
+# ESO Archive TAP service. Programmatic access: https://archive.eso.org/programmatic/
+tap_url = "https://archive.eso.org/tap_obs"
+# Radial-velocity spectroscopy instruments searched first.
+instruments = ["HARPS", "ESPRESSO"]
+
+[matching]
+# Coordinate-matching tolerance in arcseconds.
+# For high-proper-motion objects, compare coordinates at the same epoch (see README).
+radius_arcsec = 5.0
+
+[pipeline]
+# Maximum light-curve files downloaded per star in stage 1.
+max_products_per_target = 1
+# Number of planets in the NASA Exoplanet Archive sample.
+planet_sample_limit = 20
