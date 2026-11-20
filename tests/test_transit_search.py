@@ -8,8 +8,10 @@ from ieras_transit_search import (
     Config,
     best_covered_peak,
     classify_alias,
+    clearly_invalid_coarse_candidate,
     periodogram_sde,
     pick_peaks,
+    refine,
     vet,
 )
 
@@ -143,6 +145,62 @@ def test_strong_signal_tolerates_variable_transit_depths():
     assert any("inconsistent" in reason for reason in weak["reasons"])
 
 
+def test_repeated_signal_allows_modest_depth_scatter():
+    t = np.arange(0, 150, 0.02)
+    candidate = {"period": 10.0, "duration": 0.2, "t0": 2.0, "depth": 0.0005, "snr": 8.0}
+    f = np.ones_like(t)
+    for epoch in range(15):
+        f[np.abs(t - (2.0 + epoch * 10.0)) < 0.1] -= 0.0005 + 0.00009 * np.sin(epoch)
+    dy = np.full_like(t, 0.0001)
+
+    result = vet(t, f, dy, candidate, [], Config())
+
+    assert Config.max_depth_chi2 < result["depth_chi2"] < Config.max_depth_chi2_repeated
+    assert result["reasons"] == []
+
+
+def test_marginal_signal_needs_support_in_both_halves():
+    t = np.arange(0, 150, 0.02)
+    candidate = {"period": 10.0, "duration": 0.2, "t0": 2.0, "depth": 0.0003, "snr": 8.0}
+    f = np.ones_like(t)
+    for epoch in range(15):
+        depth = 0.0005 if epoch < 8 else 0.00005
+        f[np.abs(t - (2.0 + epoch * 10.0)) < 0.1] -= depth
+    dy = np.full_like(t, 0.0005)
+
+    result = vet(t, f, dy, candidate, [], Config())
+
+    assert any("half transit SNR" in reason for reason in result["reasons"])
+
+
+def test_sparse_three_point_events_are_rejected():
+    t = np.arange(0, 400, 0.02)
+    candidate = {"period": 90.0, "duration": 0.06, "t0": 2.0, "depth": 0.001, "snr": 15.0}
+    f = np.ones_like(t)
+    for epoch in range(4):
+        f[np.abs(t - (2.0 + epoch * 90.0)) < 0.03] -= 0.001
+    dy = np.full_like(t, 0.0001)
+
+    result = vet(t, f, dy, candidate, [], Config())
+
+    assert result["n_transits"] == 0
+    assert "transits with data" in result["reasons"][0]
+
+
+def test_strong_repeated_three_point_transits_are_eligible():
+    t = np.arange(0, 200, 0.02)
+    candidate = {"period": 3.88, "duration": 0.06, "t0": 2.0, "depth": 0.001, "snr": 30.0}
+    f = np.ones_like(t)
+    for epoch in range(50):
+        f[np.abs(t - (2.0 + epoch * 3.88)) < 0.03] -= 0.001
+    dy = np.full_like(t, 0.0001)
+
+    result = vet(t, f, dy, candidate, [], Config())
+
+    assert result["n_transits"] >= Config.min_sparse_transits
+    assert result["reasons"] == []
+
+
 def test_local_sde_keeps_a_secondary_peak_visible():
     power = 0.01 * np.arange(10000, dtype=float)
     power[300:320] += 1000
@@ -167,6 +225,26 @@ def test_peak_selection_skips_alias_and_reaches_weaker_signal():
     assert pick_peaks(sc, 1, cfg.peak_separation, t, [first], cfg) == [3]
 
 
+def test_peak_selection_keeps_close_long_period_signals():
+    sc = {
+        "period": np.array([126.0, 127.9, 129.0, 129.94, 132.0]),
+        "power": np.array([0.0, 20.0, 0.0, 12.0, 0.0]),
+    }
+
+    assert pick_peaks(sc, 2, Config().peak_separation) == [1, 3]
+
+
+def test_coarse_screen_only_rejects_clear_failures():
+    cfg = Config()
+    valid = {"alias_of": None, "n_transits": 10, "max_event_fraction": 0.43, "depth_chi2": 5.7}
+    dominant = {**valid, "max_event_fraction": 0.9}
+    inconsistent = {**valid, "depth_chi2": 50.0}
+
+    assert not clearly_invalid_coarse_candidate(valid, cfg)
+    assert clearly_invalid_coarse_candidate(dominant, cfg)
+    assert clearly_invalid_coarse_candidate(inconsistent, cfg)
+
+
 def test_refinement_skips_single_observed_event():
     t = np.concatenate((np.arange(0, 3, 0.02), np.arange(10, 13, 0.02), np.arange(20, 23, 0.02)))
     result = SimpleNamespace(
@@ -177,3 +255,17 @@ def test_refinement_skips_single_observed_event():
     )
 
     assert best_covered_peak(t, result, min_transits=3) == 3
+
+
+def test_refinement_stays_on_weaker_peak_near_stronger_alias():
+    t = np.arange(0, 1500, 0.1)
+    f = np.ones_like(t)
+    for period, depth in ((242.0, 0.0005), (247.0, 0.001)):
+        phase = ((t - 5.0 + period / 2) % period) - period / 2
+        f[np.abs(phase) < 0.15] -= depth
+    dy = np.full_like(t, 0.0001)
+    cfg = Config(durations=(0.3,), max_refine_grid=400)
+
+    candidate = refine(t, f, dy, 242.0, cfg)
+
+    assert abs(candidate["period"] - 242.0) < 0.2

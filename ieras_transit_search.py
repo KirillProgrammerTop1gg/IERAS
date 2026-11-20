@@ -48,12 +48,12 @@ log = logging.getLogger("exo")
 # ============================ SETTINGS ============================
 @dataclass
 class Config:
-    target: str = "Kepler-62"
+    target: str = "Kepler-69"
     mission: str = "Kepler"
     author: str = "Kepler"
     cadence: Optional[str] = "long"
     flux_column: str = "pdcsap_flux"
-    out_dir: str = "exoplanet_output_2"
+    out_dir: str = "exoplanet_output"
 
     # search
     min_period: float = 1.0
@@ -62,11 +62,11 @@ class Config:
     # In astropy, a smaller frequency_factor means a denser grid and longer runtime.
     scan_freq_factor: float = 3.0  # coarse scan
     refine_freq_factor: float = 0.25  # fine grid around the peak
-    refine_halfwidth: float = 0.02  # ±2% in period around the peak
+    refine_halfwidth: float = 0.005  # keep refinement on the selected peak, not a nearby alias
     max_refine_grid: int = 5_000  # finer than transit timing resolution for typical baselines
     max_grid: int = 3_000_000
     n_peaks: int = 20  # independent peaks to vet per iteration
-    peak_separation: float = 0.02  # peaks within 2% in period count as one
+    peak_separation: float = 0.005  # keep nearby independent long-period peaks
     max_planets: int = 10
     n_jobs: int = max(1, os.cpu_count() or 1)
 
@@ -79,11 +79,17 @@ class Config:
     min_snr: float = 7.1
     min_sde: float = 8.0
     min_transits: int = 3
-    min_points_in_transit: int = 3
+    min_points_in_transit: int = 5  # reject events defined by only a few cadences
+    sparse_transit_points: int = 3
+    min_sparse_transits: int = 20
+    min_sparse_snr: float = 20.0
     min_coverage: float = 0.5  # fraction of expected in-transit cadences
     max_odd_even_sigma: float = 3.0
     max_single_event_fraction: float = 0.6
     max_depth_chi2: float = 5.0
+    max_depth_chi2_repeated: float = 6.0
+    repeated_signal_transits: int = 8
+    min_half_snr: float = 5.5
     max_depth_chi2_strong: float = 15.0  # allow astrophysical depth variation for strong signals
     strong_signal_snr: float = 12.0
     strong_signal_transits: int = 8
@@ -455,10 +461,17 @@ def vet(t, f, dy, c, accepted, cfg):
     for ep in np.unique(epoch[intr]):
         m = intr & (epoch == ep)
         n = int(m.sum())
-        if n < cfg.min_points_in_transit or n < cfg.min_coverage * expected:
+        if n < cfg.sparse_transit_points or n < cfg.min_coverage * expected:
             continue
         sig = np.sqrt(np.sum(dy[m] ** 2)) / n
         rows.append((ep, 1.0 - np.mean(f[m]), sig, n))
+    dense_rows = [row for row in rows if row[3] >= cfg.min_points_in_transit]
+    use_sparse = (
+        len(dense_rows) < cfg.min_transits
+        and len(rows) >= cfg.min_sparse_transits
+        and c["snr"] >= cfg.min_sparse_snr
+    )
+    rows = rows if use_sparse else dense_rows
     rows = np.array(rows) if rows else np.zeros((0, 4))
     out["n_transits"] = len(rows)
     if len(rows) < cfg.min_transits:
@@ -487,6 +500,26 @@ def vet(t, f, dy, c, accepted, cfg):
         beta = 1.0
     out["beta"] = float(beta)
     out["snr_corr"] = c["snr"] / beta
+    if use_sparse and out["snr_corr"] < cfg.min_sparse_snr:
+        out["reasons"].append(
+            f"sparse transit SNR {out['snr_corr']:.1f} < {cfg.min_sparse_snr:.1f}"
+        )
+    if len(rows) >= cfg.repeated_signal_transits and out["snr_corr"] < 10:
+        midpoint = (t[0] + t[-1]) / 2
+        for label, half in (
+            ("first", t0 + ep * P < midpoint),
+            ("second", t0 + ep * P >= midpoint),
+        ):
+            if not np.any(half):
+                out["reasons"].append(f"no transits in the {label} half of observations")
+                continue
+            half_weight = 1 / s[half] ** 2
+            half_snr = np.sum(half_weight * d[half]) / np.sqrt(np.sum(half_weight))
+            out[f"{label}_half_snr"] = float(half_snr)
+            if half_snr < cfg.min_half_snr:
+                out["reasons"].append(
+                    f"{label} half transit SNR {half_snr:.1f} < {cfg.min_half_snr:.1f}"
+                )
 
     # Check single-event dominance and depth consistency.
     contrib = np.clip(d / s, 0, None) ** 2
@@ -501,7 +534,11 @@ def vet(t, f, dy, c, accepted, cfg):
     depth_limit = (
         cfg.max_depth_chi2_strong
         if len(rows) >= cfg.strong_signal_transits and out["snr_corr"] >= cfg.strong_signal_snr
-        else cfg.max_depth_chi2
+        else (
+            cfg.max_depth_chi2_repeated
+            if len(rows) >= cfg.repeated_signal_transits
+            else cfg.max_depth_chi2
+        )
     )
     if chi2 > depth_limit:
         out["reasons"].append(f"transit depths are inconsistent (chi2={chi2:.1f})")
@@ -529,6 +566,17 @@ def vet(t, f, dy, c, accepted, cfg):
             out["warnings"].append("significant secondary eclipse (possible eclipsing binary)")
 
     return out
+
+
+def clearly_invalid_coarse_candidate(v, cfg):
+    """Skip peaks that cannot survive refinement without hiding borderline signals."""
+    return (
+        v["alias_of"] is not None
+        or v["n_transits"] < cfg.min_transits
+        or v.get("max_event_fraction", 0.0) > 0.8
+        or v.get("depth_chi2", 0.0) > 2 * cfg.max_depth_chi2_repeated
+        or v.get("odd_even_sigma", 0.0) > 2 * cfg.max_odd_even_sigma
+    )
 
 
 # ============================ ITERATION ============================
@@ -621,6 +669,15 @@ def run_search(segments, cfg):
                 )
                 < cfg.min_transits
             ):
+                continue
+            coarse = dict(
+                period=float(sc["period"][i]),
+                duration=float(sc["duration"][i]),
+                t0=float(sc["t0"][i]),
+                depth=float(sc["depth"][i]),
+                snr=float(sc["snr"][i]),
+            )
+            if clearly_invalid_coarse_candidate(vet(t, f, dy, coarse, accepted, cfg), cfg):
                 continue
             c = refine(t, f, dy, float(sc["period"][i]), cfg)
             c["sde"] = float(sc["sde"][i])
